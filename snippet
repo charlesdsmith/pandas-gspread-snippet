@@ -1,0 +1,234 @@
+# pandas-gspread-snippet
+Just a snippet of code that takes information from one spreadsheet then compares it to another and updates accordingly
+
+import sys
+import os
+moduleDir = os.path.abspath(os.path.join(__file__, "../../Helpers"))
+sys.path.insert(0, moduleDir)
+
+from pdfminer.pdfinterp import PDFResourceManager, PDFPageInterpreter
+from datetime import datetime
+import io
+import os
+import gspread
+from gspread_dataframe import get_as_dataframe, set_with_dataframe
+from gspread import exceptions
+import pandas as pd
+
+from pdfminer.converter import HTMLConverter, TextConverter
+from pdfminer.layout import LAParams
+from pdfminer.pdfpage import PDFPage
+from PDFUtil import getString
+from random import randint
+try:
+    import FromMailToGoogle.textAnalyzer as textAnalyzer
+except:
+    import textAnalyzer as textAnalyzer
+try:
+    import FromMailToGoogle.inputToSheets as inputToSheets
+except:
+    import inputToSheets as inputToSheets
+try:
+    import uploadToDrive as uploadToDrive
+except:
+    import FromMailToGoogle.uploadToDrive as uploadToDrive
+import threading
+import logging
+import time
+from MailRobot.FromMailToGoogle import carfaxReports
+from MailRobot.FromMailToGoogle.carfaxReports import getTokens
+from AdesaPurchaseList.inputToSheets import updateExternalRunListCARFAX
+
+logger = logging.getLogger('frommailtogoogle')
+hdlr = logging.FileHandler('C:/Users/user/Dropbox/recalls/MailRobot/FromMailToGoogle/logfile.log')
+formatter = logging.Formatter('%(asctime)s %(message)s')
+hdlr.setFormatter(formatter)
+logger.addHandler(hdlr)
+logger.setLevel(logging.INFO)
+
+projectPath = os.path.dirname(os.path.abspath(__file__))
+
+abspath = os.path.abspath(__file__)
+dname = os.path.dirname(abspath)
+os.chdir(dname)
+
+GoogleDriveAuth = uploadToDrive.authenticate()
+gc = inputToSheets.startAuthorization()
+theBigSheet = inputToSheets.startWorksheet(gc)
+theShortSheet = inputToSheets.startShortWorksheet(gc)
+#theBOSSheet = inputToSheets.startTradeRevWorksheet(gc)
+registrationSheet = inputToSheets.startRegistrationsFriday(gc)
+carfaxSheet = inputToSheets.startCarfaxSheet(gc)
+
+allThreads = []
+current_month_and_year = datetime.now().strftime('%h') + datetime.now().strftime('%Y')
+
+def getFiles(daysFromToday=0):
+    import win32com.client
+    from dateutil import parser
+
+    outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
+    inbox = outlook.Folders("fhie@germanstarmotors.ca").Folders("Inbox")
+
+    # criteria
+    # sender_address = "kristin.hammond@coxautoinc.com"
+    subjectContains = "Sale Contract and Addendum"
+
+    # searches for most recent email
+    messages = inbox.Items
+    message = messages.GetLast()
+
+    path = createFolderDownload()
+    selected_days = datetime.timedelta(days=daysFromToday)
+
+    today = datetime.datetime.today()
+    start = today - selected_days
+    print(start)
+    done = False
+    while done==False:
+        for item in messages:
+            msgdt = parser.parse(str(message.SentOn)).replace(tzinfo=None)
+            # print(msgdt)
+            if start<=msgdt and subjectContains in message.Subject and "re:" not in message.Subject.lower():
+                print(message.Subject,"Number of attachments:",len(message.Attachments))
+                for attachment in message.Attachments:
+                    try:
+                        #    print(attachment.FileName)
+                        attachment.SaveAsFile(path + '\\{}'.format(attachment.FileName))
+                    except:
+                        print("NOT SAVED")
+            elif start>msgdt:
+                done=True
+                break
+            message = messages.GetPrevious()
+
+def deleteFiles(path):
+    import os
+    directory = os.listdir(path)
+
+    for file in directory:
+        if getFileSize(file)<80:
+            os.remove('BOS\{}'.format(file))
+    print(len(directory),"Files deleted.")
+
+def getFileSize(file):
+    import os
+    KBsize = round(os.stat('BOS\{}'.format(file)).st_size/1000,0)
+    return KBsize
+
+
+def RenameFilesNEW(path):
+    import os
+    directory = os.listdir(path)
+    vinsFound = []
+
+    #when mail arrives need to add it to "BillsofSale" worksheet
+    bosSheet = inputToSheets.startTradeRevWorksheet(gc, "BillsOfSale")
+
+    #create the dataframe from the BillsofSale worksheet
+    bos_to_df = get_as_dataframe(bosSheet)
+
+    final_vin_and_url_list = []
+    #compare BOS to short sheet
+    #start a index 0 for first inserting in to the dataframe
+    indexNo = 0
+    vin_row_index = []
+    for file in directory:
+        #will return the vin
+        carVin, pdfAsText = getString(projectPath + "\BOS\{}".format(file), 'text', False)
+
+        driveFileId = uploadToDrive.uploadFileNoDuplicates(GoogleDriveAuth,"BOS/"+file, carVin)
+        driveUrl = "https://drive.google.com/open?id=" + driveFileId
+
+        bos_to_df.loc[indexNo, 'VIN'] = carVin
+        bos_to_df.loc[indexNo, 'URL'] = driveUrl
+
+        #move to the next index to insert the new row in the df
+        indexNo += 1
+
+        if carVin != '':
+            filePath = os.path.join("BOS",file)
+            newFileName = carVin[-6:]+".pdf"
+            try:
+                os.rename(filePath, os.path.join("BOS",newFileName))
+            except Exception as inst:
+                print(inst)
+                print('filename ' + str(newFileName) + ' already exists')
+                ## print('filepath '  + filePath+' newFileName ' +newFileName)
+
+    #convert the dataframe to the google spreadsheet in one call when the loop is finished
+    set_with_dataframe(bosSheet, bos_to_df)
+
+    return vinsFound
+    ##locVal,dateVal,vinVal,SalesDetailsList,SalesValuesList = retrieveHTMLText(file)
+    # print(vinVal[-6:])
+
+
+#this function will compare the BOS to the worksheet (short or long) and update it accordingly
+def BOS_to_Short_Sheet():
+    bosSheet = inputToSheets.startTradeRevWorksheet(gc, 'BillsOfSale')
+    #need to reformat carSaleDate
+    reformatted_carSaleDate = ''
+    vins_no_urls = []
+    vins_and_urls = []
+
+    try:
+        #convert to dataframe
+        short_sheet_to_df = get_as_dataframe(theShortSheet)
+
+        #create the dataframe from the BillsofSale worksheet
+        #drop rows where both 'VIN' and 'URL are missing
+        bos_to_df = get_as_dataframe(bosSheet).dropna(how='all')
+
+        for row, cell in enumerate(short_sheet_to_df['VIN'].values):
+            #get all the vins that have no urls, or 'NaN' in that cell
+            print('loop 2 - ')
+            if str(short_sheet_to_df.loc[row, 'VIN']) != 'nan' and str(short_sheet_to_df.loc[row, 'Bill of sale']) == 'nan':
+                #store the row and vin as a tuple (row, 'vin')
+                vins_no_urls.append((row, cell))
+
+        for row, cell in enumerate(bos_to_df['VIN'].values):
+            #get all the vins and their urls and place them in a tuple ('vin', 'url')
+            vins_and_urls.append((cell, bos_to_df.loc[row, 'Bill of sale']))
+            print('loop 1')
+
+            #remove duplicates from vins_no_urls
+            for vin in vins_no_urls:
+                if cell == vin[0]:
+                    print('hey')
+                    vin = (row, cell)
+                else:
+                    print('nope')
+
+
+        #returns a list of tuples containing the row and vin if the vin from vin_no_urls is in vins_and_urls
+        matching_vins = [i for i in vins_no_urls for vin in vins_and_urls if i[1] == vin[0]]
+        print(matching_vins)
+
+        for vin in matching_vins:
+            short_sheet_to_df.loc[vin[0], 'Bill of sale'] = vin[1]
+
+        #vins_and_urls_no_dups = [vins_and_urls.remove(i) for i in vins_and_urls for x in vins_and_urls if i[0] == x[0]]
+
+        temp_list = []
+        '''for record in vins_and_urls:
+            if record[0] in temp_list:
+                '''
+
+        set_with_dataframe(theShortSheet, short_sheet_to_df)
+
+    #if it's not found gspread will raise an error and we catch it
+    except gspread.SpreadsheetNotFound:
+        this_month = carSaleDate.reformat
+        #create the new sheet with this month/year as the name
+        sheet = theShortSheet.create(this_month)
+        wksh_to_df = get_as_dataframe(sheet)
+
+        #return the all the values in the VIN column
+        for index, cell in enumerate(wksh_to_df['VIN'].values):
+
+            if carVin == cell:
+                vins_row_index.append(index)
+            #if the passed argument carVin matches the value of the VIN in the cell
+            if wksh_to_df.loc[vins_row_index.pop(), 'Bill of sale'] == 'NaN':
+                pass
